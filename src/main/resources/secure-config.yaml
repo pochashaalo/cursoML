@@ -1,0 +1,13 @@
+http:
+  port: "![BTjQqzQheTM=]"
+
+tls:
+  keyStore:
+    type: "![SPoTffdQSBc=]"
+    path: "![2szFHQdfVBtzT9e6I9UKhRd7KnDPW+UP]"
+    alias: "![sH/lOrL22Yg=]"
+    keyPassword: "![c72bREVng+8ns4IMHA/S2Q==]"
+    password: "![c72bREVng+8ns4IMHA/S2Q==]"
+
+api:
+  id: "![hkvw+W5FRo+F716zxwkcHA==]"
