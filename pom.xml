@@ -5,7 +5,7 @@
      <groupId>57fab304-078e-4617-bf9b-d13df834aedf</groupId>
      <artifactId>solutions-bom</artifactId>
      <version>1.0.0</version> 
-     <relativePath>../parent-pom/pom.xml</relativePath> 
+     <relativePath>/parent-pom/pom.xml</relativePath> 
  </parent>
 	<groupId>57fab304-078e-4617-bf9b-d13df834aedf</groupId>
 	<artifactId>check-in-papi</artifactId>
