@@ -601,6 +601,13 @@
       <name>Anypoint Exchange</name>
       <url>https://maven.anypoint.mulesoft.com/api/v3/maven</url>
     </repository>
+    <repository>
+			<id>mulesoft-public</id>
+			<url>https://repository.mulesoft.org/nexus/content/groups/public/</url>
+			<snapshots>
+				<enabled>false</enabled>
+			</snapshots>
+		</repository>
   </repositories>
   <pluginRepositories>
     <pluginRepository>
