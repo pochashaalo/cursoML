@@ -1,0 +1,178 @@
+name: Mule Build, Exchange Publish and Sandbox Deploy
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mule-exchange-publish-${{ github.ref }}
+  queue: max
+
+# Let the cache select dependencies by their source repository.
+env:
+  MAVEN_OPTS: -Daether.enhancedLocalRepository.split=true -Daether.enhancedLocalRepository.splitRemoteRepository=true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build and publish Mule application
+    # Limit both jobs to the repository's default branch, including manual runs.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && !github.event.deleted
+    outputs:
+      artifact_id: ${{ steps.package.outputs.artifact_id }}
+    environment: exchange
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          mvn-server-credentials: |
+            ${{ vars.EXCHANGE_SERVER_ID || 'anypoint-exchange-v3' }}:CA_MAVEN_USERNAME:CA_MAVEN_PASSWORD
+            releases-ee:RELEASES_EE_USERNAME:RELEASES_EE_PASSWORD
+
+      - &cache-maven
+        name: Cache public Maven dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.m2/repository/cached/central
+            ~/.m2/repository/cached/mulesoft-public
+            ~/.m2/repository/cached/mulesoft-releases
+          key: maven-public-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: maven-public-v1-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Compile and package Mule application
+        id: package
+        env:
+          RELEASES_EE_USERNAME: ${{ secrets.RELEASES_EE_USERNAME }}
+          RELEASES_EE_PASSWORD: ${{ secrets.RELEASES_EE_PASSWORD }}
+          CA_CLIENT_ID: ${{ secrets.CA_CLIENT_ID }}
+          CA_CLIENT_SECRET: ${{ secrets.CA_CLIENT_SECRET }}
+        run: |
+          : "${RELEASES_EE_USERNAME:?Set RELEASES_EE_USERNAME}"
+          : "${RELEASES_EE_PASSWORD:?Set RELEASES_EE_PASSWORD}"
+          if [[ -z "$CA_CLIENT_ID" || -z "$CA_CLIENT_SECRET" ]]; then
+            echo "::error::Set CA_CLIENT_ID and CA_CLIENT_SECRET for Exchange access."
+            exit 1
+          fi
+
+          export CA_MAVEN_USERNAME='~~~Client~~~'
+          export CA_MAVEN_PASSWORD="$CA_CLIENT_ID~?~$CA_CLIENT_SECRET"
+          mvn -V -B -ntp -DskipTests clean package help:evaluate \
+            -Dexpression=project.id -Doutput="$RUNNER_TEMP/maven-project-id"
+          echo "artifact_id=$(cut -d: -f2 "$RUNNER_TEMP/maven-project-id")" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the Mule application JAR is already in Exchange
+        id: exchange_version
+        env:
+          CA_CLIENT_ID: ${{ secrets.CA_CLIENT_ID }}
+          CA_CLIENT_SECRET: ${{ secrets.CA_CLIENT_SECRET }}
+        run: |
+          token="$(curl --fail --silent --show-error --max-time 30 \
+            --data-urlencode 'grant_type=client_credentials' \
+            --data-urlencode "client_id=$CA_CLIENT_ID" \
+            --data-urlencode "client_secret=$CA_CLIENT_SECRET" \
+            'https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token' \
+            | jq -er '.access_token | select(type == "string" and length > 0)')"
+          printf '::add-mask::%s\n' "$token"
+
+          # Maven project.id is groupId:artifactId:packaging:version.
+          asset_path="$(jq -Rer 'split(":") as [$groupId, $artifactId, $packaging, $version]
+            | select($packaging == "mule-application")
+            | [$groupId, $artifactId, $version] | map(@uri) | join("/")' "$RUNNER_TEMP/maven-project-id")"
+          asset_metadata="$RUNNER_TEMP/exchange-asset.json"
+          status="$(curl --silent --show-error --max-time 30 --output "$asset_metadata" \
+            --write-out '%{http_code}' --header "Authorization: Bearer $token" \
+            "https://anypoint.mulesoft.com/exchange/api/v2/assets/$asset_path")"
+          case "$status" in
+            200)
+              if ! jq -e '.type == "app" and any(.files[]?; .classifier == "mule-application" and .packaging == "jar")' \
+                "$asset_metadata" > /dev/null 2>&1; then
+                echo "::error::An Exchange asset occupies this version without a Mule application JAR."
+                exit 1
+              fi
+              echo "This Mule application version is already in Exchange. Skipping publish."
+              echo 'exists=true' >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo 'exists=false' >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Exchange asset lookup returned HTTP $status. Publishing was halted."
+              exit 1
+              ;;
+          esac
+
+      - name: Publish Mule application to Anypoint Exchange
+        if: steps.exchange_version.outputs.exists == 'false'
+        env:
+          RELEASES_EE_USERNAME: ${{ secrets.RELEASES_EE_USERNAME }}
+          RELEASES_EE_PASSWORD: ${{ secrets.RELEASES_EE_PASSWORD }}
+          CA_CLIENT_ID: ${{ secrets.CA_CLIENT_ID }}
+          CA_CLIENT_SECRET: ${{ secrets.CA_CLIENT_SECRET }}
+        run: |
+          export CA_MAVEN_USERNAME='~~~Client~~~'
+          export CA_MAVEN_PASSWORD="$CA_CLIENT_ID~?~$CA_CLIENT_SECRET"
+          mvn -B -ntp -DskipTests deploy
+
+  deploy_cloudhub:
+    name: Deploy the published Mule app to CloudHub Sandbox
+    needs: build
+    environment: cloudhub-sandbox
+    runs-on: ubuntu-26.04
+    # Allow Maven's deployment verification to finish after runner setup.
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          mvn-server-credentials: |
+            ${{ vars.CLOUDHUB_SERVER_ID || 'cloudhub-deploy' }}:CA_MAVEN_USERNAME:CA_MAVEN_PASSWORD
+            releases-ee:RELEASES_EE_USERNAME:RELEASES_EE_PASSWORD
+
+      - *cache-maven
+
+      - name: Deploy the Exchange asset to CloudHub 2.0
+        env:
+          RELEASES_EE_USERNAME: ${{ secrets.RELEASES_EE_USERNAME }}
+          RELEASES_EE_PASSWORD: ${{ secrets.RELEASES_EE_PASSWORD }}
+          CA_CLIENT_ID: ${{ secrets.CA_CLIENT_ID }}
+          CA_CLIENT_SECRET: ${{ secrets.CA_CLIENT_SECRET }}
+          ANYPOINT_PLATFORM_CLIENT_ID: ${{ secrets.ANYPOINT_PLATFORM_CLIENT_ID }}
+          ANYPOINT_PLATFORM_CLIENT_SECRET: ${{ secrets.ANYPOINT_PLATFORM_CLIENT_SECRET }}
+          CLOUDHUB_ENCRYPT_KEY: ${{ secrets.CLOUDHUB_ENCRYPT_KEY }}
+        run: |
+          : "${CA_CLIENT_ID:?Set CA_CLIENT_ID}"
+          : "${CA_CLIENT_SECRET:?Set CA_CLIENT_SECRET}"
+          : "${ANYPOINT_PLATFORM_CLIENT_ID:?Set ANYPOINT_PLATFORM_CLIENT_ID}"
+          : "${ANYPOINT_PLATFORM_CLIENT_SECRET:?Set ANYPOINT_PLATFORM_CLIENT_SECRET}"
+          : "${CLOUDHUB_ENCRYPT_KEY:?Set CLOUDHUB_ENCRYPT_KEY}"
+
+          export CA_MAVEN_USERNAME='~~~Client~~~'
+          export CA_MAVEN_PASSWORD="$CA_CLIENT_ID~?~$CA_CLIENT_SECRET"
+          mvn -V -B -ntp \
+            -DapplicationName="check-in-app-florhabernov26-1" \
+            -Danypoint.platform.client_id="$ANYPOINT_PLATFORM_CLIENT_ID" \
+            -Danypoint.platform.client_secret="$ANYPOINT_PLATFORM_CLIENT_SECRET" \
+            -Dencrypt.key="$CLOUDHUB_ENCRYPT_KEY" \
+            mule:deploy
