@@ -35,6 +35,7 @@
 				<version>${mule.maven.plugin.version}</version>
 				<extensions>true</extensions>
 				<configuration>
+					<classifier>mule-application</classifier>
 					<cloudhub2Deployment>
 						<!-- URL of the control plane -->
 						<uri>https://anypoint.mulesoft.com</uri>
